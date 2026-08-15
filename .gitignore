@@ -1,0 +1,13 @@
+# Raw Cronometer exports -- personal health data, regenerable via the client
+*.csv
+*.npy
+
+# Local calibration overrides
+config_local.py
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
