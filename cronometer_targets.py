@@ -103,6 +103,8 @@ class DayTarget:
     protein_g: float
     carb_g: float
     fat_g: float
+    sleep_score: float | None = None   # Garmin sleep score, 0-100
+    recovery: float | None = None      # Garmin recovery score, 0-100
 
     @property
     def remaining(self) -> float:
@@ -131,6 +133,7 @@ def fetch_targets(
     """Reconstruct the daily energy target for each day in the range."""
     nutrition = client.export_csv("daily", start, end)
     exercises = client.export_csv("exercises", start, end)
+    biometrics = client.export_csv("biometrics", start, end)
 
     macros: dict[str, dict] = {}
     for row in csv.DictReader(io.StringIO(nutrition)):
@@ -140,6 +143,14 @@ def fetch_targets(
     for row in csv.DictReader(io.StringIO(exercises)):
         # Cronometer reports exercise kcal as negative; we want magnitude.
         burned[row["Day"]] += abs(_f(row["Calories Burned"]))
+
+    sleep_scores: dict[str, float] = {}
+    recovery_scores: dict[str, float] = {}
+    for row in csv.DictReader(io.StringIO(biometrics)):
+        if row["Metric"] == "Sleep Score (Garmin)":
+            sleep_scores[row["Day"]] = _f(row["Amount"])
+        elif row["Metric"] == "Recovery (Garmin)":
+            recovery_scores[row["Day"]] = _f(row["Amount"])
 
     out: list[DayTarget] = []
     cur = start
@@ -162,6 +173,8 @@ def fetch_targets(
                 protein_g=protein,
                 carb_g=carb,
                 fat_g=fat,
+                sleep_score=sleep_scores.get(key),
+                recovery=recovery_scores.get(key),
             )
         )
         cur += timedelta(days=1)
@@ -241,13 +254,18 @@ def main() -> int:
     finally:
         client.logout()
 
-    hdr = f"{'date':<12}{'target':>8}{'BMR':>8}{'exercise':>10}{'TEF':>8}{'eaten':>9}{'left':>9}"
+    hdr = (
+        f"{'date':<12}{'target':>8}{'BMR':>8}{'exercise':>10}{'TEF':>8}{'eaten':>9}"
+        f"{'left':>9}{'sleep':>7}{'recov':>7}"
+    )
     print(hdr)
     print("-" * len(hdr))
     for r in rows:
+        sleep = f"{r.sleep_score:.0f}" if r.sleep_score is not None else "-"
+        recov = f"{r.recovery:.0f}" if r.recovery is not None else "-"
         print(
             f"{r.day.isoformat():<12}{r.target:8.0f}{r.bmr:8.0f}{r.exercise:10.0f}"
-            f"{r.tef:8.0f}{r.consumed:9.0f}{r.remaining:9.0f}"
+            f"{r.tef:8.0f}{r.consumed:9.0f}{r.remaining:9.0f}{sleep:>7}{recov:>7}"
         )
     return 0
 
