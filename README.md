@@ -83,6 +83,59 @@ date          target     BMR  exercise     TEF    eaten     left  sleep  recov
 `sleep` and `recov` are Garmin's Sleep Score and Recovery Score (0-100), pulled
 from the `biometrics` export. They show as `-` for days with no synced value.
 
+## Day-to-day usage
+
+`cronometer_diary.py` is a plain script, not a server — there's nothing to
+"run and leave running." Two ways to drive it:
+
+- **Direct CLI**, when you already know exactly what you're logging (see
+  commands above).
+- **Through a Claude Code session** (terminal, desktop app, IDE extension, or
+  claude.ai/code — anything with real shell/network access, *not* a plain
+  claude.ai chat or Project, since those can't execute the script or call
+  Cronometer's API). Just say what you ate in plain English — "log 2 eggs and
+  a slice of toast to breakfast" — and it runs `search`/`add` for you,
+  including the food_id/measure_id lookup and the grams-vs-serving-count call
+  you'd otherwise have to make yourself.
+
+### One-time setup
+
+```bash
+git clone https://github.com/khperera/crono-connector && cd crono-connector
+pip install -r requirements.txt
+
+# put these in your shell profile (~/.zshrc, ~/.bashrc), not typed daily:
+export CRONOMETER_USERNAME=you@example.com
+export CRONOMETER_PASSWORD=yourpassword
+```
+
+### Logging a whole meal at once
+
+`add-batch` takes a JSON array so a multi-item meal is one command instead of
+several:
+
+```bash
+python cronometer_diary.py add-batch '[
+  {"food_id": 450856, "measure_id": 998940, "amount": 118},
+  {"food_id": 462346, "measure_id": 1058699, "amount": 244}
+]'
+```
+
+### Sessions and rate limits
+
+- The first command of the day logs in for real and caches the session to
+  `~/.cache/cronometer-connector/session.json` (mode 600). Every command
+  after that, across separate invocations, reuses it — no repeat logins.
+  If the cached session goes stale mid-command, it's dropped and refreshed
+  automatically, once.
+- All requests (search, add, everything) share one process-wide limiter that
+  paces calls **at least 10 seconds apart**. This is a courtesy margin, not
+  a guarantee — Cronometer's actual rate-limit policy isn't published.
+- If you do see `CronometerError: Cronometer is rate-limiting this
+  account/IP`, stop. Don't script a retry loop around it — that's exactly
+  what tripped the limit during this project's development. Wait several
+  minutes with no further requests, then try once.
+
 ## Why the target needed reconstructing
 
 The energy target is **not** a field any endpoint returns. Network capture of
