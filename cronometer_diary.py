@@ -112,7 +112,7 @@ class _RateLimiter:
     hammering an endpoint that just asked us to stop. Fail fast instead and
     let the caller decide when to try again."""
 
-    def __init__(self, min_interval: float = 1.5):
+    def __init__(self, min_interval: float = 10.0):
         self.min_interval = min_interval
         self._last_call = 0.0
 
