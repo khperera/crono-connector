@@ -33,20 +33,25 @@ Rate limiting
 Cronometer throttles repeated logins on this endpoint hard enough to lock an
 account out for several minutes ("Too Many Attempts") -- this was hit during
 development, from little more than a dozen logins in quick succession while
-testing. Two things here are aimed straight at that:
+testing. Cronometer doesn't publish the actual policy (attempt threshold,
+window, per-account vs per-IP, whether more attempts during the lockout
+extend it), so this deliberately does NOT try to out-guess it with a
+retry/backoff loop -- that risks hammering an endpoint that already asked us
+to stop. Instead:
 
   - Every request (login included) goes through a shared rate limiter that
-    enforces a minimum gap between calls and retries with backoff on a
-    rate-limit response instead of failing immediately.
+    only enforces a minimum gap between calls, to make triggering the limit
+    less likely in the first place. If Cronometer reports we're already
+    rate-limited, it fails immediately with CronometerError rather than
+    retrying -- wait it out before trying again.
   - The session (user id + token) is cached to disk after login and reused
     by later invocations, so running the CLI repeatedly -- e.g. one command
     per food while logging a meal -- costs one login total, not one per
     call. get_foods()/add_servings() also let one *client-side* call cover
     several foods/servings, each still a separate HTTP request but sharing
-    the one cached session and the shared rate limiter's spacing, which is
-    what actually keeps a batch from tripping the limit. There is no single
-    HTTP call that logs multiple servings at once -- no such endpoint was
-    found.
+    the one cached session and the shared rate limiter's spacing. There is
+    no single HTTP call that logs multiple servings at once -- no such
+    endpoint was found.
 
 Usage:
     export CRONOMETER_USERNAME=you@example.com
@@ -70,7 +75,6 @@ from __future__ import annotations
 
 import json
 import os
-import random
 import sys
 import time
 from dataclasses import dataclass, field
@@ -96,44 +100,39 @@ class CronometerError(RuntimeError):
 
 
 class _RateLimiter:
-    """Enforces a minimum gap between requests and retries with exponential
-    backoff when Cronometer itself rate-limits us -- either HTTP 429, or (as
-    observed live) an HTTP-200 body of {"result": "FAIL", "error": "Too Many
-    Attempts. Please try again later."}."""
+    """Enforces a minimum gap between requests, to make it less likely we
+    trigger Cronometer's own (undocumented) rate limiting in the first place.
 
-    def __init__(
-        self,
-        min_interval: float = 1.5,
-        max_retries: int = 5,
-        base_backoff: float = 20.0,
-        max_backoff: float = 180.0,
-    ):
+    Deliberately does NOT auto-retry once Cronometer has already told us to
+    back off -- either HTTP 429, or (as observed live) an HTTP-200 body of
+    {"result": "FAIL", "error": "Too Many Attempts. Please try again later."}.
+    Cronometer doesn't publish the actual policy (attempt threshold, window,
+    whether it's per-account or per-IP, whether it resets or extends on each
+    additional attempt), so guessing a backoff-and-retry schedule risks
+    hammering an endpoint that just asked us to stop. Fail fast instead and
+    let the caller decide when to try again."""
+
+    def __init__(self, min_interval: float = 1.5):
         self.min_interval = min_interval
-        self.max_retries = max_retries
-        self.base_backoff = base_backoff
-        self.max_backoff = max_backoff
         self._last_call = 0.0
 
     def send(self, post_fn) -> requests.Response:
-        """Call post_fn() -> requests.Response, pacing and retrying as needed."""
-        attempt = 0
-        while True:
-            elapsed = time.monotonic() - self._last_call
-            if elapsed < self.min_interval:
-                time.sleep(self.min_interval - elapsed)
-            self._last_call = time.monotonic()
+        """Call post_fn() -> requests.Response, pacing calls at least
+        min_interval apart. Raises CronometerError immediately, with no
+        retry, if the response signals we're already rate-limited."""
+        elapsed = time.monotonic() - self._last_call
+        if elapsed < self.min_interval:
+            time.sleep(self.min_interval - elapsed)
+        self._last_call = time.monotonic()
 
-            resp = post_fn()
-            if not self._is_rate_limited(resp):
-                return resp
-            if attempt >= self.max_retries:
-                raise CronometerError(
-                    "Cronometer is still rate-limiting this account after "
-                    f"{self.max_retries} retries; wait a few minutes before trying again."
-                )
-            delay = min(self.base_backoff * (2**attempt), self.max_backoff) + random.uniform(0, 1)
-            time.sleep(delay)
-            attempt += 1
+        resp = post_fn()
+        if self._is_rate_limited(resp):
+            raise CronometerError(
+                "Cronometer is rate-limiting this account/IP (\"Too Many Attempts\"). "
+                "The exact cooldown isn't documented -- wait at least several minutes "
+                "with no further requests before retrying."
+            )
+        return resp
 
     @staticmethod
     def _is_rate_limited(resp: requests.Response) -> bool:
