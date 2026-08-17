@@ -1,15 +1,50 @@
 # cronometer-connector
 
-Read-only Python client for [Cronometer](https://cronometer.com), plus an exact
-reconstruction of Cronometer's dynamic daily calorie target.
+Python client for [Cronometer](https://cronometer.com): CSV exports, an exact
+reconstruction of Cronometer's dynamic daily calorie target, and diary
+read/write (recent items, food search, adding entries at specific amounts).
 
 Cronometer has **no official public API**. This talks to the same internal
-endpoints the web app uses, authenticating with your own username and password.
+endpoints the apps use, authenticating with your own username and password.
 Personal use only.
 
 ## What it does
 
-**`cronometer_client.py`** — logs in and pulls CSV exports:
+**`cronometer_diary.py`** — recent items, food/recipe search, and diary writes,
+via Cronometer's mobile app API (`mobile.cronometer.com`):
+
+```bash
+export CRONOMETER_USERNAME=you@example.com
+export CRONOMETER_PASSWORD=yourpassword
+
+python cronometer_diary.py search "banana"     # search the food database
+python cronometer_diary.py recent              # recently-logged items
+python cronometer_diary.py recipes             # your saved recipes
+python cronometer_diary.py food 450856         # measures/units for one food
+python cronometer_diary.py add 450856 998940 118   # log 118 (of that measure) to today's diary
+python cronometer_diary.py diary               # today's diary entries
+```
+
+`add` takes a `food_id` and `measure_id` from `search`/`recent`/`recipes`/`food`
+output, and an `amount` in that measure's unit — grams for weight-style
+measures, or a serving count (1.0 = one full recipe) for recipe/serving-style
+measures. See the module docstring in `cronometer_diary.py` for the endpoint
+details (`find_food`, `get_recent_foods`, `add_serving`, ...), reverse-engineered
+by authenticating against a live account and inspecting request/response pairs.
+
+Two things keep repeated use from tripping Cronometer's login rate limit
+(hit during development after about a dozen logins in quick succession):
+the session token is cached to disk and reused across invocations (one
+login covers many commands, not one per command), and every request goes
+through a shared limiter that paces calls and backs off automatically on a
+rate-limit response. `food` accepts multiple ids and `add-batch` accepts a
+JSON array of entries — both make several diary/food lookups under one
+cached session instead of one login each, though each is still its own
+HTTP request; Cronometer has no endpoint that logs multiple servings in a
+single call.
+
+**`cronometer_client.py`** — logs in and pulls CSV exports (read-only, via a
+different internal API — Cronometer's GWT-RPC endpoints):
 
 | kind | contents |
 |---|---|
@@ -47,6 +82,59 @@ date          target     BMR  exercise     TEF    eaten     left  sleep  recov
 
 `sleep` and `recov` are Garmin's Sleep Score and Recovery Score (0-100), pulled
 from the `biometrics` export. They show as `-` for days with no synced value.
+
+## Day-to-day usage
+
+`cronometer_diary.py` is a plain script, not a server — there's nothing to
+"run and leave running." Two ways to drive it:
+
+- **Direct CLI**, when you already know exactly what you're logging (see
+  commands above).
+- **Through a Claude Code session** (terminal, desktop app, IDE extension, or
+  claude.ai/code — anything with real shell/network access, *not* a plain
+  claude.ai chat or Project, since those can't execute the script or call
+  Cronometer's API). Just say what you ate in plain English — "log 2 eggs and
+  a slice of toast to breakfast" — and it runs `search`/`add` for you,
+  including the food_id/measure_id lookup and the grams-vs-serving-count call
+  you'd otherwise have to make yourself.
+
+### One-time setup
+
+```bash
+git clone https://github.com/khperera/crono-connector && cd crono-connector
+pip install -r requirements.txt
+
+# put these in your shell profile (~/.zshrc, ~/.bashrc), not typed daily:
+export CRONOMETER_USERNAME=you@example.com
+export CRONOMETER_PASSWORD=yourpassword
+```
+
+### Logging a whole meal at once
+
+`add-batch` takes a JSON array so a multi-item meal is one command instead of
+several:
+
+```bash
+python cronometer_diary.py add-batch '[
+  {"food_id": 450856, "measure_id": 998940, "amount": 118},
+  {"food_id": 462346, "measure_id": 1058699, "amount": 244}
+]'
+```
+
+### Sessions and rate limits
+
+- The first command of the day logs in for real and caches the session to
+  `~/.cache/cronometer-connector/session.json` (mode 600). Every command
+  after that, across separate invocations, reuses it — no repeat logins.
+  If the cached session goes stale mid-command, it's dropped and refreshed
+  automatically, once.
+- All requests (search, add, everything) share one process-wide limiter that
+  paces calls **at least 10 seconds apart**. This is a courtesy margin, not
+  a guarantee — Cronometer's actual rate-limit policy isn't published.
+- If you do see `CronometerError: Cronometer is rate-limiting this
+  account/IP`, stop. Don't script a retry loop around it — that's exactly
+  what tripped the limit during this project's development. Wait several
+  minutes with no further requests, then try once.
 
 ## Why the target needed reconstructing
 
@@ -112,12 +200,25 @@ Pass `fit_tef=True` with several fed days to re-fit all four parameters.
 
 ## Caveats
 
-- **This rides on an unversioned internal API.** `GWT_HEADER` and
+- **This rides on unversioned internal APIs.** `GWT_HEADER` and
   `GWT_PERMUTATION` in `cronometer_client.py` are version-pinned to a
-  Cronometer frontend build and go stale when they ship an update, causing auth
-  errors. Refresh instructions are in the module docstring.
-- **Read-only.** There is no write access — recipes, food entries, and diary
-  edits cannot be created through these endpoints.
+  Cronometer web build and go stale when they ship an update, causing auth
+  errors — refresh instructions are in that module's docstring.
+  `cronometer_diary.py` rides on the mobile app's API instead, pinned to an
+  Android build string (`build`/`device` in `CronometerDiaryClient.login`);
+  it can go stale the same way if Cronometer changes what that endpoint
+  accepts.
+- **`cronometer_client.py` is read-only** — CSV exports only, no write access.
+  **`cronometer_diary.py` can write** — it adds real entries to your diary via
+  `add_serving`/`add`. There's no undo command built in; delete a bad entry
+  from the Cronometer app itself if needed.
+- **Login rate limiting.** Cronometer throttles repeated logins on the mobile
+  endpoint hard enough to lock an account out for several minutes ("Too Many
+  Attempts"). `cronometer_diary.py` mitigates this with a disk-cached session
+  (login once, reuse across CLI invocations) and a shared rate limiter with
+  backoff on all requests, but the lockout is enforced server-side — if you
+  do trip it (e.g. a burst of fresh-login testing with `use_cache=False`),
+  the only fix is to wait it out.
 - **Alcohol TEF is unidentified** — every calibration day had 0 g alcohol.
   Expect a small underestimate on drinking days; literature alcohol TEF is high
   (~10–30%).
@@ -132,4 +233,9 @@ pip install -r requirements.txt
 
 ## Prior art
 
-Auth flow derived from [`gocronometer`](https://github.com/jrmycanady/gocronometer) (GPLv2), a Go client for the same endpoints.
+GWT export auth flow derived from [`gocronometer`](https://github.com/jrmycanady/gocronometer)
+(GPLv2), a Go client for the same endpoints. Mobile API endpoint shapes for
+`cronometer_diary.py` cross-checked against
+[`cronometer-api-mcp`](https://github.com/rwestergren/cronometer-api-mcp), an
+MCP server reverse-engineered against the same `mobile.cronometer.com` API,
+then independently confirmed by authenticating against a live account.
